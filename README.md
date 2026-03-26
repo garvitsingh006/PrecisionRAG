@@ -73,7 +73,7 @@ START
 
 ## Setup
 
-### 3. Create a Virtual Enviornment
+### 1. Create a Virtual Enviornment
 ```bash
 python -m venv myvenv
 ```
