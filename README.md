@@ -38,6 +38,8 @@ START
                                                                                                                          └── (max retries)  ──► no_answer ──► END
 ```
 
+![Alt text](./Graph_Architecture.png)
+
 ---
 
 ## Key Features
@@ -71,13 +73,21 @@ START
 
 ## Setup
 
-### 1. Install dependencies
+### 3. Create a Virtual Enviornment
+```bash
+python -m venv myvenv
+```
+```bash
+.\myvenv\Scripts\Activate
+```
+
+### 2. Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Configure environment variables
+### 3. Configure environment variables
 
 Create a `.env` file in the project root:
 
@@ -87,7 +97,7 @@ TAVILY_API_KEY=your_tavily_key
 DB_URI_GRAPH=postgresql://user:password@localhost:5432/yourdb
 ```
 
-### 3. Add your PDF documents
+### 4. Add your PDF documents
 
 Place your PDF files in the project root and update the loader in the notebook:
 
