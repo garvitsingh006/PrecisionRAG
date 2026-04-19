@@ -1,6 +1,6 @@
 .env
-venv
 *.env
-cache
-faiss_index
-__pycache__
+venv/
+cache/
+faiss_index/
+__pycache__/
