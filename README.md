@@ -105,12 +105,12 @@ Create a `.env` file in the project root:
 ```env
 HUGGINGFACEHUB_API_TOKEN=your_hf_token
 TAVILY_API_KEY=your_tavily_key
-DB_URI_FASTAPI=postgresql://user:password@localhost:5432/yourdb
+DB_URI_FASTAPI=postgresql+psycopg://user:password@localhost:5432/yourdb
 DB_URI_GRAPH=postgresql://user:password@localhost:5432/yourdb
 ```
 
-> `DB_URI_FASTAPI` is used by SQLAlchemy to store runs, evaluations, and configs.  
-> `DB_URI_GRAPH` is used by LangGraph's `PostgresSaver` for graph state checkpointing.
+> `DB_URI_FASTAPI` uses the `postgresql+psycopg://` scheme — SQLAlchemy requires the explicit `+psycopg` driver suffix.  
+> `DB_URI_GRAPH` uses plain `postgresql://` — LangGraph's `PostgresSaver` handles the driver internally.
 
 ### 5. Add your PDF documents
 
