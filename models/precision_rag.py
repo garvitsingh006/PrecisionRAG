@@ -76,7 +76,7 @@ def build_or_load_retriever():
 
     vector_store = FAISS.from_documents(chunks, embeddings)
 
-    vector_store.save_local("faiss_index")  # 🔥 magic line
+    vector_store.save_local("faiss_index")
 
     return vector_store.as_retriever(search_kwargs={"k": 4})
 
