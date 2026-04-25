@@ -22,8 +22,8 @@ def run_new_evaluation(input: schemas.NewEvaluationInput, db: Session, workflow)
         usefulness_retries=0,
         latency_ms=0,
         config_id=input.config_id,
-        status="running",          # IMPORTANT
-        question=input.question          # if you added this column
+        status="running",
+        question=input.question
     )
 
     db.add(new_run)
@@ -31,8 +31,10 @@ def run_new_evaluation(input: schemas.NewEvaluationInput, db: Session, workflow)
     db.refresh(new_run)
 
     try:
-        # 2. Run workflow
-        config = {
+        # 2. Load config from DB
+        exp_config = db.query(ExperimentConfig).filter_by(id=input.config_id).first()
+
+        langgraph_config = {
             "configurable": {
                 "thread_id": new_run.id
             }
@@ -41,10 +43,19 @@ def run_new_evaluation(input: schemas.NewEvaluationInput, db: Session, workflow)
         initial_state: State = {
             "question": input.question,
             "retrieval_query": "",
-            "answer": ""
+            "answer": "",
+            "corrective_retrieval_attempted": False,
+            "run_config": {
+                "model": exp_config.model,
+                "embedding_model": exp_config.embedding_model,
+                "chunk_size": exp_config.chunk_size,
+                "chunk_overlap": exp_config.chunk_overlap,
+                "top_k": exp_config.top_k,
+                "temperature": exp_config.temperature,
+            }
         }
 
-        final_state = workflow.invoke(initial_state, config)
+        final_state = workflow.invoke(initial_state, langgraph_config)
         final_state["confidence"] = compute_confidence(final_state)
 
         # 3. Update run
@@ -118,14 +129,14 @@ def resume_evaluation(run_id: int, db: Session, workflow):
         run.status = "running"
         db.commit()
 
-        config = {
+        langgraph_config = {
             "configurable": {
                 "thread_id": run.id
             }
         }
 
-        # ⚠️ No initial_state → this is what makes it resume
-        final_state = workflow.invoke(None, config)
+        # No initial_state → resumes from last PostgreSQL checkpoint
+        final_state = workflow.invoke(None, langgraph_config)
         final_state["confidence"] = compute_confidence(final_state)
 
         # 3. Update run

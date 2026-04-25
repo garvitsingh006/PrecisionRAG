@@ -1,9 +1,8 @@
 import time
-from typing import List, TypedDict
+from typing import List, TypedDict, Optional
 from pydantic import BaseModel, Field
 from typing import Annotated, Literal
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_community.chat_models import ChatOllama
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint, HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -12,83 +11,107 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_classic.output_parsers import OutputFixingParser
 from langchain_community.tools.tavily_search import TavilySearchResults
-from langchain_tavily import TavilySearch
-from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.graph import StateGraph, START, END
 from dotenv import load_dotenv
 import os
 
 load_dotenv()
 
-
-
-
-# Essentials
 MAX_HALLU_RETRIES = 3
 MAX_USEFUL_RETRIES = 3
-DB_URI_GRAPH = os.getenv("DB_URI_GRAPH")
-llm = HuggingFaceEndpoint(
-    repo_id="deepseek-ai/DeepSeek-V3",
-    task="text-generation",
-    provider="novita",
-    max_new_tokens=5000
-)
-model = ChatHuggingFace(llm=llm)
-
 UPPER_TH = 0.7
 LOWER_TH = 0.3
+
+
+def get_model(model_id: str, temperature: float):
+    llm = HuggingFaceEndpoint(
+        repo_id=model_id,
+        task="text-generation",
+        provider="novita",
+        max_new_tokens=5000,
+        temperature=temperature,
+    )
+    return ChatHuggingFace(llm=llm)
 
 
 
 
 ### Document loading, chunking, embedding, and retrieval function
-def build_or_load_retriever():
-    if os.path.exists("faiss_index"):
-        print("Loading FAISS index from disk...")
-        embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2",
-            cache_folder="./cache"
-        )
-        vector_store = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
-        return vector_store.as_retriever(search_kwargs={"k": 4})
+_retriever_cache: dict = {}
+_parent_chunks_cache: dict = {}  # ADD THIS
 
-    print("Building FAISS index...")
-    
+def build_or_load_retriever(chunk_size, chunk_overlap, top_k, embedding_model):
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     folder_path = os.path.join(BASE_DIR, "docs")
 
+    pdf_files = sorted([
+        f for f in os.listdir(folder_path)
+        if f.endswith(".pdf") or f.endswith(".PDF")
+    ]) if os.path.exists(folder_path) else []
+
+    if not pdf_files:
+        return None
+
+    cache_key = (tuple(pdf_files), chunk_size, chunk_overlap, embedding_model)
+
+    if cache_key in _retriever_cache:
+        print("Retriever cache hit.")
+        return _retriever_cache[cache_key].as_retriever(search_kwargs={"k": top_k})
+
+    print("Building FAISS index with parent-document retrieval...")
     docs = []
-    for file in os.listdir(folder_path):
-        if file.endswith(".pdf") or file.endswith(".PDF"):
-            print(f"Loading: {file}")
-            loader = PyPDFLoader(os.path.join(folder_path, file))
-            docs.extend(loader.load())
+    for file in pdf_files:
+        loader = PyPDFLoader(os.path.join(folder_path, file))
+        docs.extend(loader.load())
 
-    chunks = RecursiveCharacterTextSplitter(
-        chunk_size=700,
-        chunk_overlap=150
-    ).split_documents(docs)
+    # Parent chunks — bigger, used for answer generation
+    parent_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size * 3,
+        chunk_overlap=chunk_overlap * 2,
+    )
+    parent_chunks = parent_splitter.split_documents(docs)
 
-    embeddings = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2",
-        cache_folder="./cache"
+    # Child chunks — smaller, used for retrieval
+    child_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
     )
 
-    vector_store = FAISS.from_documents(chunks, embeddings)
+    child_docs = []
+    for parent_id, parent in enumerate(parent_chunks):
+        children = child_splitter.split_documents([parent])
+        for child in children:
+            child.metadata["parent_id"] = parent_id  # link to parent
+            child_docs.append(child)
 
-    vector_store.save_local("faiss_index")
+    embeddings = HuggingFaceEmbeddings(
+        model_name=embedding_model,
+        cache_folder=os.path.join(BASE_DIR, "..", "cache")
+    )
 
-    return vector_store.as_retriever(search_kwargs={"k": 4})
-
-retriever = build_or_load_retriever()
+    vector_store = FAISS.from_documents(child_docs, embeddings)
+    _retriever_cache[cache_key] = vector_store
+    _parent_chunks_cache[cache_key] = parent_chunks  # STORE PARENTS
+    return vector_store.as_retriever(search_kwargs={"k": top_k})
 
 ### State
+class RunConfig(TypedDict):
+    model: str
+    embedding_model: str
+    chunk_size: int
+    chunk_overlap: int
+    top_k: int
+    temperature: float
+
+
 class State(TypedDict):
     question: str
     retrieval_query: str
+    run_config: RunConfig
 
     should_retrieve: bool
-    
+    corrective_retrieval_attempted: bool
+
     websearch_query: str
     websearch_docs: List[Document]
 
@@ -154,14 +177,13 @@ retrieve_decision_prompt = ChatPromptTemplate.from_messages(
         )
     ]
 ).partial(format_instructions=retrieve_decision_parser.get_format_instructions())
-retrieve_decision_chain = retrieve_decision_prompt | model | retrieve_decision_parser
 
 def decide_retrieval(state: State) -> State:
-    decision : RetrieveDecision = retrieve_decision_chain.invoke({"question": state["question"]})
+    model = get_model(state["run_config"]["model"], state["run_config"]["temperature"])
+    retrieve_decision_chain = retrieve_decision_prompt | model | retrieve_decision_parser
+    decision: RetrieveDecision = retrieve_decision_chain.invoke({"question": state["question"]})
     print(f"Retrieval decided: {decision.should_retrieve}")
-    return {
-        "should_retrieve": decision.should_retrieve
-    }
+    return {"should_retrieve": decision.should_retrieve}
 
 # -------------------------------- SELF_RAG_NODE_2: Direct Generation --------------------------------
 class DirectGenerationSchema(BaseModel):
@@ -174,113 +196,134 @@ direct_generation_prompt = ChatPromptTemplate.from_messages(
         ("human", "Question: {question}")
     ]
 ).partial(format_instructions=direct_generation_parser.get_format_instructions())
-direct_generation_chain = direct_generation_prompt | model | direct_generation_parser
 
 def direct_generate(state: State) -> State:
     print("Generating Directly...")
+    model = get_model(state["run_config"]["model"], state["run_config"]["temperature"])
+    direct_generation_chain = direct_generation_prompt | model | direct_generation_parser
     response = direct_generation_chain.invoke({"question": state["question"]})
-    return {
-        "answer": response.answer
-    }
+    return {"answer": response.answer}
 
 
 # -------------------------------- CRAG_NODE_1: Retrieve Docs from DB --------------------------------
 def retrieve(state: State) -> State:
     q = state["retrieval_query"]
+    cfg = state["run_config"]
     print("Retrieving docs...")
-    docs = retriever.invoke(q)
-    return {
-        "docs": docs
-    }
 
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    folder_path = os.path.join(BASE_DIR, "docs")
+    pdf_files = sorted([f for f in os.listdir(folder_path) if f.endswith(".pdf") or f.endswith(".PDF")])
+    cache_key = (tuple(pdf_files), cfg["chunk_size"], cfg["chunk_overlap"], cfg["embedding_model"])
+
+    retriever = build_or_load_retriever(
+        chunk_size=cfg["chunk_size"],
+        chunk_overlap=cfg["chunk_overlap"],
+        top_k=cfg["top_k"],
+        embedding_model=cfg["embedding_model"],
+    )
+    if retriever is None:
+        return {"docs": []}
+
+    child_hits = retriever.invoke(q)
+
+    # Swap each child for its parent
+    parent_chunks = _parent_chunks_cache.get(cache_key, [])
+    if not parent_chunks:
+        return {"docs": child_hits}  # fallback if cache miss
+
+    seen_parent_ids = set()
+    result_docs = []
+    for child in child_hits:
+        pid = child.metadata.get("parent_id")
+        if pid is not None and pid not in seen_parent_ids:
+            seen_parent_ids.add(pid)
+            result_docs.append(parent_chunks[pid])
+        elif pid is None:
+            result_docs.append(child)
+
+    print(f"Retrieved {len(child_hits)} child chunks → expanded to {len(result_docs)} parent chunks")
+    return {"docs": result_docs}
 
 # -------------------------------- CRAG_NODE_2: Evaluate Retrieved Docs --------------------------------
-class EvaluateSchema(BaseModel):
-    score: Annotated[float, Field(..., description="Relevancy score of the text with respect to answering the question", ge=0.0, le=1.0)]
-    reasoning: Annotated[str, Field(..., description="A one-line reasoning for the given score")]
+class DocScore(BaseModel):
+    index: int = Field(..., description="0-based index of the document chunk")
+    score: float = Field(..., ge=0.0, le=1.0, description="Relevance score between 0.0 and 1.0")
+    reasoning: str = Field(..., description="One-line reasoning for the score")
 
-evaluate_docs_parser = PydanticOutputParser(pydantic_object=EvaluateSchema)
-evaluate_fixing_parser = OutputFixingParser.from_llm(
-    parser=evaluate_docs_parser,
-    llm=model
-)
-evaluate_docs_prompt = ChatPromptTemplate.from_messages(
+class BatchEvalSchema(BaseModel):
+    scores: List[DocScore] = Field(..., description="One entry per document chunk, in the same order as provided")
+
+batch_eval_parser = PydanticOutputParser(pydantic_object=BatchEvalSchema)
+batch_eval_prompt = ChatPromptTemplate.from_messages(
     [
         (
             "system",
-            """
-            You are a document relevance evaluator.
-
-            Your job is to score how useful a piece of text is for answering the question.
-
-            Important rules:
-            - A document does NOT need to directly answer the question to be relevant.
-            - If the question asks for comparison, information about ANY entity mentioned in the question is useful.
-            - Background information, rules, definitions, or explanations about those entities should receive a high score.
-            - Only give low scores if the text is unrelated to the topic.
-
-            Scoring guide:
-            1.0 = contains a direct answer or very strong evidence
-            0.7–0.9 = contains important information needed to answer the question
-            0.4–0.6 = somewhat useful background information
-            0.0–0.3 = unrelated
-
-            Return JSON only.
-            If you do not return valid JSON, your response is useless.
-
-            {format_instructions}
-            """
+            "You are an expert document relevance evaluator for a RAG pipeline.\n\n"
+            "You will be given a QUESTION and a numbered list of document chunks.\n"
+            "Your task is to score each chunk on how useful it is for answering the question.\n\n"
+            "Scoring rules:\n"
+            "- 1.0 : chunk contains a direct answer or decisive evidence\n"
+            "- 0.7–0.9 : chunk contains important facts clearly needed to answer the question\n"
+            "- 0.4–0.6 : chunk contains background or partial information that is somewhat useful\n"
+            "- 0.1–0.3 : chunk is loosely related but unlikely to help\n"
+            "- 0.0 : chunk is completely unrelated to the question\n\n"
+            "Important:\n"
+            "- A chunk does NOT need to directly answer the question to score high.\n"
+            "- If the question asks for a comparison, any chunk about ANY entity in the question is useful.\n"
+            "- Rules, definitions, background context, and supporting evidence all count as relevant.\n"
+            "- Be consistent: similar chunks should receive similar scores.\n"
+            "- You MUST return exactly one score object per chunk, in the same order, with the correct 0-based index.\n\n"
+            "{format_instructions}"
         ),
-        ("human", "Text: {text}\n\n Question: {question}")
+        (
+            "human",
+            "QUESTION: {question}\n\n"
+            "DOCUMENT CHUNKS:\n{chunks}"
+        )
     ]
-).partial(format_instructions=evaluate_docs_parser.get_format_instructions())
-
-evaluate_docs_chain = evaluate_docs_prompt | model | evaluate_fixing_parser
+).partial(format_instructions=batch_eval_parser.get_format_instructions())
 
 def evaluate_retrieved_docs(state: State) -> State:
     docs = state["docs"]
-    good_docs : List[Document] = []
-    results : List[EvaluateSchema] = []
-    evaluation_result = ""
-
     if not docs:
-        evaluation_result = "incorrect"
-        return {
-            "good_docs": [],
-            "evaluation_result": evaluation_result
-        }
+        return {"good_docs": [], "evaluation_result": "incorrect", "retrieved_docs_relevance_score": 0.0}
 
-    # invoke to evaluate docs
-    print("Evaluating retrieved docs...")
     def clean_text(text):
         return " ".join(text.split())
-    for d in docs:
-        results.append(evaluate_docs_chain.invoke({"text": clean_text(d.page_content), "question": state["question"]}))
 
-    print("RAW MODEL OUTPUT:", results)
-    
-    # add good_docs
-    for doc, res in zip(docs, results):
-        if res.score > LOWER_TH:
+    numbered_chunks = "\n\n".join(
+        f"[{i}] {clean_text(d.page_content)}" for i, d in enumerate(docs)
+    )
+
+    model = get_model(state["run_config"]["model"], state["run_config"]["temperature"])
+    fixing_parser = OutputFixingParser.from_llm(parser=batch_eval_parser, llm=model)
+    chain = batch_eval_prompt | model | fixing_parser
+
+    print(f"Evaluating {len(docs)} retrieved docs in a single call...")
+    result: BatchEvalSchema = chain.invoke({"question": state["question"], "chunks": numbered_chunks})
+
+    scores_by_index = {s.index: s for s in result.scores}
+    good_docs: List[Document] = []
+    all_scores: List[float] = []
+
+    for i, doc in enumerate(docs):
+        score_obj = scores_by_index.get(i)
+        score = score_obj.score if score_obj else 0.0
+        all_scores.append(score)
+        if score > LOWER_TH:
             good_docs.append(doc)
 
-    # check scores
-    # case 1: atleast one score above 0.7
-    if any(r.score > UPPER_TH for r in results):
+    avg_score = sum(all_scores) / len(all_scores)
+
+    if any(s > UPPER_TH for s in all_scores):
         evaluation_result = "correct"
-
-    # case 2: all scores below 0.3
-    elif all(r.score < LOWER_TH for r in results):
+    elif all(s < LOWER_TH for s in all_scores):
         evaluation_result = "incorrect"
-
-    # case 3: atleast one ambiguous score         
     else:
-        evaluation_result="ambiguous"
+        evaluation_result = "ambiguous"
 
-    all_scores = [result.score for result in results]
-    scores = [s for s in all_scores]  # collect the float scores you already compute
-    avg_score = sum(scores) / len(scores) if scores else 0.0
-
+    print(f"Doc scores: {all_scores} → {evaluation_result}")
     return {
         "good_docs": good_docs,
         "evaluation_result": evaluation_result,
@@ -307,7 +350,6 @@ rewrite_prompt = ChatPromptTemplate.from_messages(
         )
     ]
 ).partial(format_instructions=rewrite_parser.get_format_instructions())
-rewrite_chain = rewrite_prompt | model | rewrite_parser
 
 tavily = TavilySearchResults(max_results=5)
 
@@ -329,41 +371,56 @@ def search_on_web(query):
     return web_docs
 
 def web_search(state: State) -> State:
-    # rewrite query
+    model = get_model(state["run_config"]["model"], state["run_config"]["temperature"])
+    rewrite_chain = rewrite_prompt | model | rewrite_parser
     try:
         rewritten = rewrite_chain.invoke({"question": state["question"]})
         websearch_query = rewritten.websearch_query
     except Exception:
-        websearch_query = state["question"]  # fallback
-    
+        websearch_query = state["question"]
     websearch_docs = search_on_web(websearch_query)
-
-    return {
-        "websearch_docs": websearch_docs,
-        "websearch_query": websearch_query
-    }
+    return {"websearch_docs": websearch_docs, "websearch_query": websearch_query}
 
 
 # -------------------------------- CRAG_NODE_4: Refine --------------------------------
-class KeepOrDrop(BaseModel):
-    keep: bool
+class BatchFilterSchema(BaseModel):
+    decisions: List[bool] = Field(
+        ...,
+        description="Ordered list of true/false decisions, one per chunk. true = keep, false = drop."
+    )
 
-filter_parser = PydanticOutputParser(pydantic_object = KeepOrDrop)
-filter_prompt = ChatPromptTemplate.from_messages(
+batch_filter_parser = PydanticOutputParser(pydantic_object=BatchFilterSchema)
+batch_filter_prompt = ChatPromptTemplate.from_messages(
     [
         (
             "system",
-            "You are a strict relevance filter.\n"
-            "Return keep=True only if the text chunk helps answer the question.\n"
-            "The chunk may contain multiple sentences.\n"
-            "Output only JSON.\n"
-            "Follow the following output format: {format_instructions}"
+            "You are a precision context filter for a RAG pipeline.\n\n"
+            "You will be given a QUESTION and a numbered list of text chunks extracted from documents.\n"
+            "For each chunk, decide whether it should be KEPT or DROPPED from the context that will be\n"
+            "used to generate an answer.\n\n"
+            "Keep a chunk (true) if ANY of the following apply:\n"
+            "- It contains facts, figures, dates, names, or events directly relevant to the question\n"
+            "- It provides necessary background or definitions needed to understand the answer\n"
+            "- It contains partial evidence that, combined with other chunks, helps answer the question\n"
+            "- It narrows down or constrains the answer in a meaningful way\n\n"
+            "Drop a chunk (false) if ALL of the following apply:\n"
+            "- It is completely off-topic relative to the question\n"
+            "- It contains only boilerplate, headers, page numbers, or formatting artifacts\n"
+            "- Removing it would not affect the quality of the final answer at all\n\n"
+            "Rules:\n"
+            "- Be INCLUSIVE rather than exclusive — when in doubt, keep the chunk\n"
+            "- You MUST return exactly one boolean per chunk, in the same order as provided\n"
+            "- The length of 'decisions' must equal the number of chunks\n"
+            "- Do not merge, reorder, or skip any chunks\n\n"
+            "{format_instructions}"
         ),
-        ("human", "Question: {question}\n\n Chunk:\n{chunk}"),
+        (
+            "human",
+            "QUESTION: {question}\n\n"
+            "TEXT CHUNKS:\n{chunks}"
+        )
     ]
-).partial(format_instructions=filter_parser.get_format_instructions())
-
-filter_chain = filter_prompt | model | filter_parser
+).partial(format_instructions=batch_filter_parser.get_format_instructions())
 
 recursive_splitter = RecursiveCharacterTextSplitter(
     chunk_size=250,
@@ -375,36 +432,34 @@ def refine(state: State) -> State:
     q = state["question"]
 
     if not state["docs"]:
-        return {
-            "refined_context": "",
-            "kept_strips": [],
-            "strips": []
-        }
+        return {"refined_context": "", "kept_strips": [], "strips": []}
 
-    docs_to_be_refined : List[Document] = []
-    if state["evaluation_result"] == "correct":
-        docs_to_be_refined = state["good_docs"]
-    else:
-        docs_to_be_refined = state["good_docs"] + state["websearch_docs"]
+    docs_to_refine: List[Document] = (
+        state["good_docs"] if state["evaluation_result"] == "correct"
+        else state["good_docs"] + state["websearch_docs"]
+    )
 
-    context = "\n\n".join(d.page_content for d in docs_to_be_refined).strip()
-
-    # Decompose
+    context = "\n\n".join(d.page_content for d in docs_to_refine).strip()
     strips = recursive_splitter.split_text(context)
 
-    print("Refining context...")
+    numbered_chunks = "\n\n".join(f"[{i}] {s}" for i, s in enumerate(strips))
 
-    # Filter
-    inputs = [{"question": q, "chunk": s} for s in strips]
-    results = filter_chain.batch(inputs)
-    kept = [s for s, r in zip(strips, results) if r.keep]
+    model = get_model(state["run_config"]["model"], state["run_config"]["temperature"])
+    fixing_parser = OutputFixingParser.from_llm(parser=batch_filter_parser, llm=model)
+    chain = batch_filter_prompt | model | fixing_parser
 
-    # Recompose
-    refined_context = "\n".join(kept)
+    print(f"Refining {len(strips)} strips in a single call...")
+    result: BatchFilterSchema = chain.invoke({"question": q, "chunks": numbered_chunks})
 
-    if not kept:
-        refined_context = "\n".join(strips[:5])
+    decisions = result.decisions
+    # guard against length mismatch from the model
+    if len(decisions) != len(strips):
+        decisions = decisions[:len(strips)] + [True] * max(0, len(strips) - len(decisions))
 
+    kept = [s for s, keep in zip(strips, decisions) if keep]
+    refined_context = "\n".join(kept) if kept else "\n".join(strips[:5])
+
+    print(f"Kept {len(kept)}/{len(strips)} strips")
     return {
         "refined_context": refined_context,
         "kept_strips": kept,
@@ -431,21 +486,16 @@ generate_prompt = ChatPromptTemplate.from_messages(
             "Question: {question}\n\nRefined Context:\n{refined_context}"
         )
     ]
-).partial(format_instructions = generate_parser.get_format_instructions())
-generate_chain = generate_prompt | model | generate_parser
+).partial(format_instructions=generate_parser.get_format_instructions())
 
 def generate_answer(state: State) -> State:
     if not state["refined_context"]:
         return {"answer": "I don't know because there was no refined context given to me"}
-    
     print("Generating response based on refined context...")
-
+    model = get_model(state["run_config"]["model"], state["run_config"]["temperature"])
+    generate_chain = generate_prompt | model | generate_parser
     response = generate_chain.invoke({"question": state["question"], "refined_context": state["refined_context"]})
-
-    answer = response.answer
-    return {
-        "answer": answer
-    }
+    return {"answer": response.answer}
 
 
 # -------------------------------- SELF_RAG_NODE_3: Check hallucination --------------------------------
@@ -492,16 +542,13 @@ is_sup_prompt = ChatPromptTemplate.from_messages(
         ),
     ]
 ).partial(format_instructions=is_sup_parser.get_format_instructions())
-is_sup_chain = is_sup_prompt | model | is_sup_parser
 
 def is_sup(state: State) -> State:
     print("Checking Hallucination")
+    model = get_model(state["run_config"]["model"], state["run_config"]["temperature"])
+    is_sup_chain = is_sup_prompt | model | is_sup_parser
     decision: Is_Sup_Decision = is_sup_chain.invoke({"question": state["question"], "answer": state["answer"], "refined_context": state["refined_context"]})
-    return {
-        "is_sup": decision.is_sup,
-        "sup_reason": decision.sup_reason,
-        "sup_score": decision.sup_score
-    }
+    return {"is_sup": decision.is_sup, "sup_reason": decision.sup_reason, "sup_score": decision.sup_score}
 
 
 # -------------------------------- SELF_RAG_NODE_4: Revise Answer --------------------------------
@@ -532,15 +579,13 @@ revise_prompt = ChatPromptTemplate.from_messages(
         )
     ]
 ).partial(format_instructions=revise_parser.get_format_instructions())
-revise_chain = revise_prompt | model | revise_parser
 
 def revise_answer(state: State) -> State:
     print("Revising answer...")
+    model = get_model(state["run_config"]["model"], state["run_config"]["temperature"])
+    revise_chain = revise_prompt | model | revise_parser
     response = revise_chain.invoke({"question": state["question"], "answer": state["answer"], "refined_context": state["refined_context"]})
-    return {
-        "answer": response.answer,
-        "hallucination_retries": state.get("hallucination_retries", 0) + 1
-    }
+    return {"answer": response.answer, "hallucination_retries": state.get("hallucination_retries", 0) + 1}
 
 
 # -------------------------------- SELF_RAG_NODE_5: Check if answer is useful --------------------------------
@@ -577,23 +622,24 @@ is_use_prompt = ChatPromptTemplate.from_messages(
         )
     ]
 ).partial(format_instructions=is_use_parser.get_format_instructions())
-is_use_chain = is_use_prompt | model | is_use_parser
 
 def is_useful(state: State) -> State:
     print("Checking usefulness of the answer...")
+    model = get_model(state["run_config"]["model"], state["run_config"]["temperature"])
+    is_use_chain = is_use_prompt | model | is_use_parser
     decision: IsUSEDecision = is_use_chain.invoke({"question": state["question"], "answer": state["answer"]})
-    return {
-        "is_useful": decision.is_useful,
-        "usefulness_reason": decision.reason,
-        "usefulness_score": decision.score
-    }
+    return {"is_useful": decision.is_useful, "usefulness_reason": decision.reason, "usefulness_score": decision.score}
 
 
-# -------------------------------- SELF_RAG_NODE_6: Rewrite question --------------------------------
+# -------------------------------- CRAG_NODE_2b / SELF_RAG_NODE_6: Rewrite Retrieval Query --------------------------------
+# Used in two situations:
+#   1. corrective: docs were ambiguous after first retrieval — rewrite before falling back to web search
+#   2. usefulness loop: full pipeline completed but answer was not useful — rewrite and re-run everything
+
 class RewriteDecision(BaseModel):
     retrieval_query: str = Field(
         ...,
-        description="Rewritten query optimized for vector retrieval against internal company PDFs."
+        description="Rewritten query optimized for vector retrieval."
     )
 
 rewrite_for_retrieval_parser = PydanticOutputParser(pydantic_object=RewriteDecision)
@@ -601,48 +647,74 @@ rewrite_for_retrieval_prompt = ChatPromptTemplate.from_messages(
     [
         (
             "system",
-            "Rewrite the user's QUESTION into a query optimized for vector retrieval over INTERNAL company PDFs.\n\n"
+            "You are a retrieval query specialist for a RAG pipeline.\n\n"
+            "You will be given a QUESTION, the PREVIOUS RETRIEVAL QUERY that was used, "
+            "the REASON the previous retrieval failed, and optionally a PREVIOUS ANSWER.\n\n"
+            "Your job is to rewrite the retrieval query so it finds better, more relevant documents "
+            "from the vector store on the next attempt.\n\n"
+            "Rewriting strategy based on failure reason:\n"
+            "- 'ambiguous_docs': the previous query was too broad or vague — use more specific "
+            "terminology, proper nouns, or domain-specific keywords; try a different angle\n"
+            "- 'not_useful_answer': the retrieved docs led to an answer that didn't address the question — "
+            "focus on the specific aspect of the question that was missed; rephrase around the core intent\n\n"
             "Rules:\n"
-            "- Keep it short (6–16 words).\n"
-            "- Preserve key entities.\n"
-            "- Remove filler words.\n"
-            "- Do NOT answer the question.\n\n"
-            "IMPORTANT:\n"
-            "- Return ONLY valid JSON.\n"
-            "- Do NOT return schema.\n"
-            "- Do NOT explain anything.\n"
-            "- Output EXACTLY in this format:\n"
-            "{\"retrieval_query\": \"your rewritten query\"}\n\n"
+            "- Keep the query between 6 and 20 words\n"
+            "- Preserve key entities and proper nouns from the original question\n"
+            "- Remove filler words\n"
+            "- Do NOT answer the question — only produce the retrieval query\n"
+            "- Return ONLY valid JSON in exactly this format: {{\"retrieval_query\": \"your rewritten query\"}}\n\n"
             "{format_instructions}"
         ),
         (
             "human",
-            "QUESTION:\n{question}\n\n"
-            "Previous retrieval query (if any):\n{retrieval_query}\n\n"
-            "Answer (if any):\n{answer}"
+            "QUESTION: {question}\n\n"
+            "PREVIOUS RETRIEVAL QUERY: {retrieval_query}\n\n"
+            "FAILURE REASON: {rewrite_reason}\n\n"
+            "PREVIOUS ANSWER (if any): {answer}"
         )
     ]
 ).partial(format_instructions=rewrite_for_retrieval_parser.get_format_instructions())
-rewrite_for_retrieval_chain = rewrite_for_retrieval_prompt | model | rewrite_for_retrieval_parser
 
-def rewrite_query(state: State) -> State:
-    print("Rewriting Question...")
+
+def _do_rewrite(state: State) -> str:
+    """Shared rewrite logic. Returns the new retrieval query string."""
+    model = get_model(state["run_config"]["model"], state["run_config"]["temperature"])
+    chain = rewrite_for_retrieval_prompt | model | rewrite_for_retrieval_parser
     try:
-        decision: RewriteDecision = rewrite_for_retrieval_chain.invoke({
+        decision: RewriteDecision = chain.invoke({
             "question": state["question"],
-            "retrieval_query": state["retrieval_query"],
-            "answer": state["answer"]
+            "retrieval_query": state.get("retrieval_query", ""),
+            "rewrite_reason": state.get("rewrite_reason", ""),
+            "answer": state.get("answer", ""),
         })
-        query = decision.retrieval_query
-
+        return decision.retrieval_query
     except Exception as e:
-        print("Rewrite failed, falling back:", e)
-        query = state["question"]  # fallback
+        print("Rewrite failed, falling back to original question:", e)
+        return state["question"]
+
+
+def corrective_rewrite(state: State) -> State:
+    """Called when evaluation_result == ambiguous. Rewrites query, re-retrieves once before web search."""
+    print("Ambiguous docs — corrective rewrite before web search...")
+    query = _do_rewrite({**state, "rewrite_reason": "ambiguous_docs"})
     return {
         "retrieval_query": query,
-        "usefulness_retries": state.get("usefulness_retries", 0) + 1,
+        "corrective_retrieval_attempted": True,
+        "docs": [],
+        "good_docs": [],
+        "evaluation_result": "",
+    }
 
-        # Resetting entire state
+
+def rewrite_query(state: State) -> State:
+    """Called when answer was not useful. Rewrites query and resets full pipeline state."""
+    print("Answer not useful — rewriting query for full re-run...")
+    query = _do_rewrite({**state, "rewrite_reason": "not_useful_answer"})
+    return {
+        "retrieval_query": query,
+        "corrective_retrieval_attempted": False,
+        "usefulness_retries": state.get("usefulness_retries", 0) + 1,
+        # Reset full pipeline state for clean re-run
         "docs": [],
         "good_docs": [],
         "websearch_query": "",
@@ -680,11 +752,12 @@ def route_should_retrieve(state: State):
     
 
 ## Condition based on evaluation
-def route(state: State) -> State:
+def route(state: State):
     if state["evaluation_result"] == "correct":
         return "good"
-    else:
-        return "bad"
+    if state["evaluation_result"] == "ambiguous" and not state.get("corrective_retrieval_attempted", False):
+        return "ambiguous"
+    return "bad"
 
 
 ## Condition based on hallucination
@@ -717,6 +790,7 @@ def build_graph(checkpointer):
     g.add_node("direct_generate", direct_generate)
     g.add_node("retrieve", retrieve)
     g.add_node("evaluate_retrieved_docs", evaluate_retrieved_docs)
+    g.add_node("corrective_rewrite", corrective_rewrite)
     g.add_node("web_search", web_search)
     g.add_node("refine", refine)
     g.add_node("generate_answer", generate_answer)
@@ -738,8 +812,10 @@ def build_graph(checkpointer):
     g.add_edge("retrieve", "evaluate_retrieved_docs")
     g.add_conditional_edges("evaluate_retrieved_docs", route, {
         "good": "refine",
+        "ambiguous": "corrective_rewrite",
         "bad": "web_search"
     })
+    g.add_edge("corrective_rewrite", "retrieve")
     g.add_edge("web_search", "refine")
     g.add_edge("refine", "generate_answer")
 
